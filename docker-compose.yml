@@ -1,0 +1,156 @@
+services:
+  cp-kafka:
+    image: confluentinc/cp-kafka:7.9.1
+    container_name: cp-kafka
+    ports:
+      - "9092:9092"
+      - "9101:9101"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://cp-kafka:29092,PLAINTEXT_HOST://localhost:9092
+      
+      KAFKA_JMX_PORT: 9101
+      KAFKA_JMX_HOSTNAME: localhost
+      
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@cp-kafka:29093
+      KAFKA_PROCESS_ROLES: broker,controller
+      
+      KAFKA_LISTENERS: PLAINTEXT://cp-kafka:29092,CONTROLLER://cp-kafka:29093,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_CONFLUENT_LICENSE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_CONFLUENT_BALANCER_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    healthcheck:
+      test:
+        [ "CMD-SHELL", "kafka-topics --bootstrap-server cp-kafka:29092 --list" ]
+
+  cp-kafka-connect:
+    image: confluentinc/cp-kafka-connect:7.8.0
+    container_name: cp-kafka-connect
+    ports:
+      - "8083:8083"
+    volumes:
+      - ./connector-config.json:/connector-config.json
+    depends_on:
+      cp-kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      CONNECT_BOOTSTRAP_SERVERS: cp-kafka:29092
+      CONNECT_GROUP_ID: 1
+      CONNECT_CLUSTER_ID: "demo-connect-cluster"
+      CONNECT_CONFIG_STORAGE_TOPIC: _connect-configs
+      CONNECT_OFFSET_STORAGE_TOPIC: _connect-offsets
+      CONNECT_STATUS_STORAGE_TOPIC: _connect-statuses
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_PLUGIN_PATH: "/usr/local/share/kafka/plugins,/usr/share/confluent-hub-components,/usr/share/java/kafka-connect-plugins"
+      CONNECT_PLUGIN_DISCOVERY_ENABLED: "true"
+      CONNECT_REST_ADVERTISED_HOST_NAME: cp-kafka-connect
+      CONNECT_REST_PORT: 8083
+      CONNECT_REST_EXTENSION_CLASSES: ""
+      CONNECT_CONNECTOR_CLIENT_CONFIG_OVERRIDE_POLICY: All
+    command:
+      - bash
+      - -c
+      - |
+        echo "Installing Connector"
+        confluent-hub install --no-prompt debezium/debezium-connector-postgresql:3.0.8
+        #
+        echo "Launching Kafka Connect worker"
+        /etc/confluent/docker/run &
+        #
+        sleep infinity
+    healthcheck:
+      test: [ "CMD-SHELL", "curl --fail http://cp-kafka-connect:8083/connectors || exit 1" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  postgres:
+    image: postgres:17.2
+    container_name: postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: demo-db
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"
+    healthcheck:
+      test: [ "CMD-SHELL", "POSTGRES_PASSWORD=password pg_isready -U user -d demo-db" ]
+      retries: 30
+      interval: 5s
+      timeout: 5s
+
+  console:
+    image: docker.redpanda.com/redpandadata/console:latest
+    container_name: redpanda-console
+    ports:
+      - "8080:8080"
+    entrypoint: /bin/sh
+    command: -c "echo \"$$CONSOLE_CONFIG_FILE\" > /tmp/config.yml; /app/console"
+    environment:
+      CONFIG_FILEPATH: /tmp/config.yml
+      CONSOLE_CONFIG_FILE: |
+        kafka:
+          brokers: ["cp-kafka:29092"]
+        connect:
+          enabled: true
+          clusters:
+            - name: demo-connect-cluster
+              url: http://cp-kafka-connect:8083
+    depends_on:
+      cp-kafka:
+        condition: service_healthy
+      cp-kafka-connect:
+        condition: service_healthy
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: transactional-outbox-app
+    ports:
+      - "8084:8084"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/demo-db
+      SPRING_DATASOURCE_USERNAME: user
+      SPRING_DATASOURCE_PASSWORD: password
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: cp-kafka:29092
+    depends_on:
+      postgres:
+        condition: service_healthy
+      cp-kafka:
+        condition: service_healthy
+      cp-kafka-connect:
+        condition: service_healthy
+
+  connector-init:
+    image: curlimages/curl:latest
+    container_name: connector-init
+    volumes:
+      - ./connector-config.json:/connector-config.json
+    command: >
+      -s -o /dev/null -w "%{http_code}"
+      -X POST -H "Content-Type: application/json"
+      --data @/connector-config.json
+      http://cp-kafka-connect:8083/connectors
+    depends_on:
+      cp-kafka-connect:
+        condition: service_healthy
